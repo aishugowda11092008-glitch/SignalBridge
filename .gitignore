@@ -4,3 +4,26 @@ __pycache__/
 .env
 signalbridge.db
 instance/
+
+# Local Python environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local databases and backups
+*.db
+*.db-*
+app_backup*.py
+app_before_*.py
+app_original.py
+app_repair_backup.py
+signalbridge_backup_*.db
+
+# Logs and generated reports
+*.log
+audit_log.jsonl
+signalbridge_reports.csv
+
+# Temporary integration scripts
+ai_loader_snippet.txt
+integrate_ai.py

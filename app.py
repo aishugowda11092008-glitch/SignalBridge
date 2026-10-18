@@ -2,6 +2,8 @@
 from flask import Flask, jsonify, render_template_string, request, Response
 import sqlite3
 import os
+import math
+import joblib
 import csv
 import io
 from datetime import datetime, timezone
@@ -10,6 +12,19 @@ app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "signalbridge.db")
+
+MODEL_PATH = os.path.join(BASE_DIR, "models", "risk_model.joblib")
+AI_MODEL = None
+AI_FEATURES = []
+
+try:
+    saved_model = joblib.load(MODEL_PATH)
+    AI_MODEL = saved_model["model"]
+    AI_FEATURES = saved_model["features"]
+    print("SignalBridge AI model loaded successfully.")
+except Exception as exc:
+    print(f"WARNING: AI model unavailable: {exc}")
+
 
 
 def connect_db():
@@ -510,6 +525,7 @@ def analytics():
         return jsonify(error="Could not load analytics."), 500
 
 
+
 @app.post("/api/risk")
 def risk():
     data = request.get_json(silent=True)
@@ -517,18 +533,51 @@ def risk():
         return jsonify(error="Send valid JSON."), 400
 
     try:
-        rain = float(data.get("rainfall_mm", 0))
-        wind = float(data.get("wind_kmh", 0))
-        humidity = float(data.get("humidity_pct", 0))
-        river = float(data.get("river_rise_cm", 0))
-        incidents = int(data.get("historical_incidents", 0))
+        values = {
+            "rainfall_mm": float(data.get("rainfall_mm", 0)),
+            "wind_kmh": float(data.get("wind_kmh", 0)),
+            "humidity_pct": float(data.get("humidity_pct", 0)),
+            "river_rise_cm": float(data.get("river_rise_cm", 0)),
+            "historical_incidents": float(data.get("historical_incidents", 0)),
+        }
 
-        if (not all(map(lambda x: x >= 0 and x < float("inf"),
-                        [rain, wind, humidity, river]))
-                or humidity > 100 or incidents < 0):
-            raise ValueError("Conditions must be non-negative; humidity max is 100.")
-    except (ValueError, TypeError, OverflowError):
-        return jsonify(error="Enter valid numeric weather values."), 400
+        if not all(math.isfinite(v) and v >= 0 for v in values.values()):
+            raise ValueError("Values must be finite and non-negative.")
+        if values["humidity_pct"] > 100:
+            raise ValueError("Humidity must not exceed 100.")
+        if not values["historical_incidents"].is_integer():
+            raise ValueError("Historical incidents must be a whole number.")
+
+    except (ValueError, TypeError, OverflowError) as exc:
+        return jsonify(error=f"Invalid input: {exc}"), 400
+
+    if AI_MODEL is None or not AI_FEATURES:
+        return jsonify(error="AI model is unavailable. Check the server logs."), 503
+
+    try:
+        features = [values[name] for name in AI_FEATURES]
+        prediction = str(AI_MODEL.predict([features])[0]).upper()
+
+        probabilities = {}
+        if hasattr(AI_MODEL, "predict_proba"):
+            raw_probabilities = AI_MODEL.predict_proba([features])[0]
+            probabilities = {
+                str(label).upper(): round(float(prob) * 100, 2)
+                for label, prob in zip(AI_MODEL.classes_, raw_probabilities)
+            }
+
+        confidence = probabilities.get(prediction)
+
+    except (KeyError, ValueError, TypeError, AttributeError):
+        app.logger.exception("AI risk prediction failed")
+        return jsonify(error="Could not calculate the AI assessment."), 500
+
+    # Retain the existing rule-based screening score for compatibility.
+    rain = values["rainfall_mm"]
+    wind = values["wind_kmh"]
+    humidity = values["humidity_pct"]
+    river = values["river_rise_cm"]
+    incidents = int(values["historical_incidents"])
 
     score = 0
     reasons = []
@@ -570,19 +619,29 @@ def risk():
 
     score = min(score, 100)
     level = "HIGH" if score >= 50 else "MODERATE" if score >= 25 else "LOW"
+
     if not reasons:
-        reasons.append("No configured threshold was reached.")
+        reasons.append("No configured rule-based threshold was reached.")
 
     explanation = (
-        f"Rule-based screening score: {score}/100. "
-        f"Classification: {level}. Factors: {'; '.join(reasons)}. "
-        "This prototype has not been validated against real disaster outcomes "
-        "and must not replace official warnings."
+        f"Rule-based screening score: {score}/100 ({level}). "
+        f"Experimental AI prediction: {prediction}. "
+        "The AI was trained on synthetic data and is not validated "
+        "for real-world disaster forecasting. Follow official warnings."
     )
 
     audit_event("risk_assessment", explanation)
-    return jsonify(score=score, level=level, reasons=reasons,
-                   explanation=explanation)
+
+    return jsonify(
+        score=score,
+        level=level,
+        reasons=reasons,
+        explanation=explanation,
+        ai_prediction=prediction,
+        ai_confidence_pct=confidence,
+        ai_probabilities=probabilities,
+        model_data_type="synthetic_demo"
+    )
 
 
 @app.get("/api/export")
